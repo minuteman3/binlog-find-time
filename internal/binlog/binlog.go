@@ -74,7 +74,7 @@ func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) 
 	// Get first event with timestamp
 	var firstTimestamp uint32
 	var foundTimestamp bool
-	
+
 	// Try to get the first timestamp
 	for i := 0; i < 10; i++ { // Limit attempts to prevent infinite loop
 		select {
@@ -103,10 +103,12 @@ func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) 
 			if ev.Header.Timestamp > 0 {
 				firstTimestamp = ev.Header.Timestamp
 				foundTimestamp = true
-				break
+				goto found // Use goto instead of break to clearly exit the outer loop
 			}
 		}
 	}
+
+found:
 
 	if !foundTimestamp {
 		return time.Time{}, time.Time{}, fmt.Errorf("no events with timestamp found in %s", binlogFile)
@@ -115,14 +117,14 @@ func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) 
 	// For the last event, we need to seek to the end
 	// This requires reading all events, which could be optimized with more knowledge of the binlog format
 	var lastTimestamp uint32 = firstTimestamp
-	
+
 	// Create a channel to signal completion
 	done := make(chan struct{})
-	
+
 	// Use a goroutine to read events with timeout
 	go func() {
 		defer close(done)
-		
+
 		// Limit the number of events to read
 		for i := 0; i < 1000; i++ {
 			select {
@@ -141,7 +143,7 @@ func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) 
 			}
 		}
 	}()
-	
+
 	// Wait for completion or timeout
 	select {
 	case <-done:
@@ -177,12 +179,12 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 			log.Printf("Warning: Could not get time range for %s: %v", binlogFiles[0], err)
 			return binlogFiles[0], false
 		}
-		
-		log.Printf("Binlog %s has time range: %s to %s", 
-			binlogFiles[0], 
+
+		log.Printf("Binlog %s has time range: %s to %s",
+			binlogFiles[0],
 			start.Format("2006-01-02 15:04:05"),
 			end.Format("2006-01-02 15:04:05"))
-		
+
 		validFiles[binlogFiles[0]] = struct{}{}
 		timeRanges[binlogFiles[0]] = struct{ start, end time.Time }{start, end}
 
@@ -211,7 +213,7 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 					log.Printf("Too many errors encountered. Stopping search.")
 					break
 				}
-				
+
 				// Try to continue with the search
 				if mid > 0 {
 					right = mid - 1
@@ -220,12 +222,12 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 				}
 				continue
 			}
-			
-			log.Printf("Binlog %s has time range: %s to %s", 
-				binlogFiles[mid], 
+
+			log.Printf("Binlog %s has time range: %s to %s",
+				binlogFiles[mid],
 				start.Format("2006-01-02 15:04:05"),
 				end.Format("2006-01-02 15:04:05"))
-			
+
 			validFiles[binlogFiles[mid]] = struct{}{}
 			timeRanges[binlogFiles[mid]] = struct{ start, end time.Time }{start, end}
 		}
@@ -252,7 +254,7 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 		// Find the closest valid file that's before the target time
 		var closestFile string
 		var closestEnd time.Time
-		
+
 		for file := range validFiles {
 			timeRange := timeRanges[file]
 			if !targetTime.Before(timeRange.end) {
@@ -262,7 +264,7 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 				}
 			}
 		}
-		
+
 		if closestFile != "" {
 			return closestFile, false
 		}
