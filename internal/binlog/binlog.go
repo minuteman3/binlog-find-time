@@ -61,6 +61,10 @@ func GetBinlogFiles(cfg replication.BinlogSyncerConfig) ([]string, error) {
 
 // GetTimeRangeForBinlog returns the start and end timestamps for a binlog file
 func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) (start, end time.Time, err error) {
+	// Create context with timeout to prevent hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Get the first event timestamp
 	streamer, err := syncer.StartSync(mysql.Position{Name: binlogFile, Pos: 4})
 	if err != nil {
@@ -69,34 +73,81 @@ func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) 
 
 	// Get first event with timestamp
 	var firstTimestamp uint32
-	ctx := context.Background()
-	for {
-		ev, err := streamer.GetEvent(ctx)
-		if err != nil {
-			return time.Time{}, time.Time{}, fmt.Errorf("failed to get event: %v", err)
-		}
+	var foundTimestamp bool
+	
+	// Try to get the first timestamp
+	for i := 0; i < 10; i++ { // Limit attempts to prevent infinite loop
+		select {
+		case <-ctx.Done():
+			return time.Time{}, time.Time{}, fmt.Errorf("timeout getting first event timestamp for %s", binlogFile)
+		default:
+			ev, err := streamer.GetEvent(ctx)
+			if err != nil {
+				return time.Time{}, time.Time{}, fmt.Errorf("failed to get event: %v", err)
+			}
 
-		// Skip events with no timestamp (like FORMAT_DESCRIPTION)
-		if ev.Header.Timestamp > 0 {
-			firstTimestamp = ev.Header.Timestamp
-			break
+			// Check for rotation event which might indicate we're reading the wrong file
+			if ev.Header.EventType == replication.ROTATE_EVENT {
+				rotateEvent := ev.Event.(*replication.RotateEvent)
+				nextFile := string(rotateEvent.NextLogName)
+				if nextFile != binlogFile {
+					log.Printf("Detected rotation from %s to %s", binlogFile, nextFile)
+					// If this is just the start event pointing to itself, continue
+					if i == 0 && nextFile == binlogFile {
+						continue
+					}
+				}
+			}
+
+			// Skip events with no timestamp (like FORMAT_DESCRIPTION)
+			if ev.Header.Timestamp > 0 {
+				firstTimestamp = ev.Header.Timestamp
+				foundTimestamp = true
+				break
+			}
 		}
+	}
+
+	if !foundTimestamp {
+		return time.Time{}, time.Time{}, fmt.Errorf("no events with timestamp found in %s", binlogFile)
 	}
 
 	// For the last event, we need to seek to the end
 	// This requires reading all events, which could be optimized with more knowledge of the binlog format
 	var lastTimestamp uint32 = firstTimestamp
+	
+	// Create a channel to signal completion
+	done := make(chan struct{})
+	
+	// Use a goroutine to read events with timeout
+	go func() {
+		defer close(done)
+		
+		// Limit the number of events to read
+		for i := 0; i < 1000; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				ev, err := streamer.GetEvent(ctx)
+				if err != nil {
+					// End of file or other error
+					return
+				}
 
-	for {
-		ev, err := streamer.GetEvent(ctx)
-		if err != nil {
-			// End of file or other error
-			break
+				if ev.Header.Timestamp > 0 {
+					lastTimestamp = ev.Header.Timestamp
+				}
+			}
 		}
-
-		if ev.Header.Timestamp > 0 {
-			lastTimestamp = ev.Header.Timestamp
-		}
+	}()
+	
+	// Wait for completion or timeout
+	select {
+	case <-done:
+		// Reading completed normally
+	case <-ctx.Done():
+		log.Printf("Timeout reading events from %s, using available timestamps", binlogFile)
 	}
 
 	// Convert Unix timestamps to time.Time
@@ -109,8 +160,15 @@ func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) 
 // BinarySearchBinlogs performs a binary search on binlog files to find which contains the target timestamp
 func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string, targetTime time.Time) (string, bool) {
 	if len(binlogFiles) == 0 {
+		log.Printf("Warning: No binlog files provided")
 		return "", false
 	}
+
+	log.Printf("Searching through %d binlog files for timestamp %s", len(binlogFiles), targetTime.Format("2006-01-02 15:04:05"))
+
+	// Track files that we've checked successfully
+	validFiles := make(map[string]struct{})
+	timeRanges := make(map[string]struct{ start, end time.Time })
 
 	// If only one file, check if it contains the target time
 	if len(binlogFiles) == 1 {
@@ -119,6 +177,14 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 			log.Printf("Warning: Could not get time range for %s: %v", binlogFiles[0], err)
 			return binlogFiles[0], false
 		}
+		
+		log.Printf("Binlog %s has time range: %s to %s", 
+			binlogFiles[0], 
+			start.Format("2006-01-02 15:04:05"),
+			end.Format("2006-01-02 15:04:05"))
+		
+		validFiles[binlogFiles[0]] = struct{}{}
+		timeRanges[binlogFiles[0]] = struct{ start, end time.Time }{start, end}
 
 		if !targetTime.Before(start) && !targetTime.After(end) {
 			return binlogFiles[0], true
@@ -129,21 +195,43 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 
 	// Binary search
 	left, right := 0, len(binlogFiles)-1
+	var errorCount int
 
 	for left <= right {
 		mid := left + (right-left)/2
 
-		start, end, err := GetTimeRangeForBinlog(syncer, binlogFiles[mid])
-		if err != nil {
-			log.Printf("Warning: Could not get time range for %s: %v", binlogFiles[mid], err)
-			// Try to continue with the search
-			if mid > 0 {
-				right = mid - 1
-			} else {
-				left = mid + 1
+		// Check if we already processed this file
+		if _, exists := timeRanges[binlogFiles[mid]]; !exists {
+			start, end, err := GetTimeRangeForBinlog(syncer, binlogFiles[mid])
+			if err != nil {
+				log.Printf("Warning: Could not get time range for %s: %v", binlogFiles[mid], err)
+				errorCount++
+				// If we've had too many errors, return what we have
+				if errorCount > 3 {
+					log.Printf("Too many errors encountered. Stopping search.")
+					break
+				}
+				
+				// Try to continue with the search
+				if mid > 0 {
+					right = mid - 1
+				} else {
+					left = mid + 1
+				}
+				continue
 			}
-			continue
+			
+			log.Printf("Binlog %s has time range: %s to %s", 
+				binlogFiles[mid], 
+				start.Format("2006-01-02 15:04:05"),
+				end.Format("2006-01-02 15:04:05"))
+			
+			validFiles[binlogFiles[mid]] = struct{}{}
+			timeRanges[binlogFiles[mid]] = struct{ start, end time.Time }{start, end}
 		}
+
+		timeRange := timeRanges[binlogFiles[mid]]
+		start, end := timeRange.start, timeRange.end
 
 		// Target time is within this binlog's range
 		if !targetTime.Before(start) && !targetTime.After(end) {
@@ -160,9 +248,30 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 	}
 
 	// If we didn't find an exact match, return the closest binlog that's before the target time
-	if left > 0 {
-		return binlogFiles[left-1], false
+	if len(validFiles) > 0 {
+		// Find the closest valid file that's before the target time
+		var closestFile string
+		var closestEnd time.Time
+		
+		for file := range validFiles {
+			timeRange := timeRanges[file]
+			if !targetTime.Before(timeRange.end) {
+				if closestFile == "" || timeRange.end.After(closestEnd) {
+					closestFile = file
+					closestEnd = timeRange.end
+				}
+			}
+		}
+		
+		if closestFile != "" {
+			return closestFile, false
+		}
 	}
 
-	return binlogFiles[0], false
+	// If no match found and we have files, return the first file
+	if len(binlogFiles) > 0 {
+		return binlogFiles[0], false
+	}
+
+	return "", false
 }

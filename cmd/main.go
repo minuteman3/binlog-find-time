@@ -172,8 +172,13 @@ func main() {
 
 	if exactMatch {
 		fmt.Printf("Found exact match in binlog file: %s\n", binlogFile)
-	} else {
+		os.Exit(0)
+	} else if binlogFile != "" {
 		fmt.Printf("Closest binlog file containing or preceding the timestamp: %s\n", binlogFile)
+		os.Exit(0)
+	} else {
+		fmt.Println("No binlog containing the target timestamp was found")
+		os.Exit(1)
 	}
 }
 
