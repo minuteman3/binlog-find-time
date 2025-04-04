@@ -166,7 +166,7 @@ func main() {
 	}
 
 	// Binary search for the binlog file
-	binlogFile, exactMatch := binlog.BinarySearchBinlogs(syncer, binlogFiles, targetTime)
+	binlogFile, exactMatch := binlog.BinarySearchBinlogs(syncerCfg, binlogFiles, targetTime)
 
 	fmt.Printf("Target time: %s\n", targetTime.Format("2006-01-02 15:04:05"))
 

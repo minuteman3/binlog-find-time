@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -20,20 +21,25 @@ type MockStreamer struct {
 
 func TestBinarySearchBinlogs(t *testing.T) {
 	tests := []struct {
-		name        string
-		binlogFiles []string
-		targetTime  time.Time
-		setupMock   func(*MockBinlogSyncer)
-		expected    string
-		exactMatch  bool
+		name         string
+		binlogFiles  []string
+		targetTime   time.Time
+		setupMock    func(*MockBinlogSyncer)
+		syncerConfig replication.BinlogSyncerConfig
+		expected     string
+		exactMatch   bool
 	}{
 		{
 			name:        "Empty binlog files",
 			binlogFiles: []string{},
 			targetTime:  time.Date(2023, 1, 1, 12, 0, 0, 0, time.UTC),
 			setupMock:   func(m *MockBinlogSyncer) {},
-			expected:    "",
-			exactMatch:  false,
+			syncerConfig: replication.BinlogSyncerConfig{
+				ServerID: 100,
+				Flavor:   "mysql",
+			},
+			expected:   "",
+			exactMatch: false,
 		},
 		{
 			name:        "Single binlog file with matching time",
@@ -43,6 +49,10 @@ func TestBinarySearchBinlogs(t *testing.T) {
 				// Mock the GetTimeRangeForBinlog behavior
 				// This is simplified for the test
 				m.On("StartSync", mock.Anything).Return(nil, nil)
+			},
+			syncerConfig: replication.BinlogSyncerConfig{
+				ServerID: 100,
+				Flavor:   "mysql",
 			},
 			expected:   "mysql-bin.000001",
 			exactMatch: true,
@@ -57,7 +67,7 @@ func TestBinarySearchBinlogs(t *testing.T) {
 
 			// For demonstration purposes
 			if len(tt.binlogFiles) == 0 {
-				result, exactMatch := BinarySearchBinlogs(nil, tt.binlogFiles, tt.targetTime)
+				result, exactMatch := BinarySearchBinlogs(tt.syncerConfig, tt.binlogFiles, tt.targetTime)
 				assert.Equal(t, tt.expected, result)
 				assert.Equal(t, tt.exactMatch, exactMatch)
 			}

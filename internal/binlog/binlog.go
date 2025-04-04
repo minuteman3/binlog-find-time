@@ -70,6 +70,8 @@ func GetTimeRangeForBinlog(syncer *replication.BinlogSyncer, binlogFile string) 
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("failed to start sync from %s: %v", binlogFile, err)
 	}
+	// Make sure we close the sync after we're done
+	defer syncer.Close()
 
 	// Get first event with timestamp
 	var firstTimestamp uint32
@@ -160,7 +162,7 @@ found:
 }
 
 // BinarySearchBinlogs performs a binary search on binlog files to find which contains the target timestamp
-func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string, targetTime time.Time) (string, bool) {
+func BinarySearchBinlogs(syncerConfig replication.BinlogSyncerConfig, binlogFiles []string, targetTime time.Time) (string, bool) {
 	if len(binlogFiles) == 0 {
 		log.Printf("Warning: No binlog files provided")
 		return "", false
@@ -174,6 +176,7 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 
 	// If only one file, check if it contains the target time
 	if len(binlogFiles) == 1 {
+		syncer := replication.NewBinlogSyncer(syncerConfig)
 		start, end, err := GetTimeRangeForBinlog(syncer, binlogFiles[0])
 		if err != nil {
 			log.Printf("Warning: Could not get time range for %s: %v", binlogFiles[0], err)
@@ -204,6 +207,8 @@ func BinarySearchBinlogs(syncer *replication.BinlogSyncer, binlogFiles []string,
 
 		// Check if we already processed this file
 		if _, exists := timeRanges[binlogFiles[mid]]; !exists {
+			// Create new syncer for each file to avoid "Sync is running" errors
+			syncer := replication.NewBinlogSyncer(syncerConfig)
 			start, end, err := GetTimeRangeForBinlog(syncer, binlogFiles[mid])
 			if err != nil {
 				log.Printf("Warning: Could not get time range for %s: %v", binlogFiles[mid], err)
